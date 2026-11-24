@@ -119,6 +119,9 @@ export default function ChatPage() {
       setMessages((prev) => [...prev, userMsg]);
       setLoading(true);
 
+      const aiMsgId = generateId();
+      let accumulatedText = "";
+
       try {
         // Build conversation history (excluding the latest user message just added)
         const history = messages.map((m) => ({
@@ -132,21 +135,66 @@ export default function ChatPage() {
           body: JSON.stringify({ message: userText, history }),
         });
 
-        const data = await response.json();
+        if (!response.ok) {
+          let errorMsg = "An unexpected error occurred. Please try again.";
+          try {
+            const data = await response.json();
+            if (data?.error) errorMsg = data.error;
+          } catch {
+            const txt = await response.text().catch(() => "");
+            if (txt) errorMsg = txt;
+          }
 
-        if (data.success && data.text) {
-          const aiMsg: ChatMessage = {
-            id: generateId(),
-            role: "assistant",
-            content: data.text,
-            timestamp: Date.now(),
-          };
-          setMessages((prev) => [...prev, aiMsg]);
-        } else {
           const errMsg: ChatMessage = {
-            id: generateId(),
+            id: aiMsgId,
             role: "assistant",
-            content: data.error || "An unexpected error occurred. Please try again.",
+            content: errorMsg,
+            timestamp: Date.now(),
+            error: true,
+          };
+          setMessages((prev) => [...prev, errMsg]);
+          return;
+        }
+
+        // Handle streaming response word-by-word
+        if (response.body) {
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let createdAiMessage = false;
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+
+            const chunk = decoder.decode(value, { stream: true });
+            accumulatedText += chunk;
+
+            if (!createdAiMessage) {
+              createdAiMessage = true;
+              setLoading(false); // First token received, stop typing dots immediately
+              const initialAiMsg: ChatMessage = {
+                id: aiMsgId,
+                role: "assistant",
+                content: accumulatedText,
+                timestamp: Date.now(),
+              };
+              setMessages((prev) => [...prev, initialAiMsg]);
+            } else {
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === aiMsgId ? { ...msg, content: accumulatedText } : msg
+                )
+              );
+            }
+          }
+        }
+
+        // If body was empty or returned nothing
+        if (!accumulatedText.trim()) {
+          const errMsg: ChatMessage = {
+            id: aiMsgId,
+            role: "assistant",
+            content: "No response was generated. Please try again.",
             timestamp: Date.now(),
             error: true,
           };
@@ -154,7 +202,7 @@ export default function ChatPage() {
         }
       } catch {
         const errMsg: ChatMessage = {
-          id: generateId(),
+          id: aiMsgId,
           role: "assistant",
           content:
             "Failed to connect to the AI service. Please check your internet connection and try again.",

@@ -5,33 +5,34 @@ import { ChatRequest, ChatResponse } from "@/types/chat";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const MAX_RETRIES = 3;
-const INITIAL_BACKOFF_MS = 1000; // 1s, 2s, 4s exponential backoff
+const MAX_RETRIES = 2; // Up to 2 retries (3 total attempts) to prevent excessive waiting
+const INITIAL_BACKOFF_MS = 600; // Fast initial retry: 600ms, 1200ms
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-interface GeminiCallResult {
+interface StreamAttemptResult {
   ok: boolean;
   status: number;
-  data?: any;
+  response?: Response;
   errorMessage?: string;
-  isHighDemand?: boolean;
+  isRetryable?: boolean;
 }
 
-async function callGeminiModel(
+async function tryStreamGemini(
   modelName: string,
   apiKey: string,
-  geminiPayload: any
-): Promise<GeminiCallResult> {
+  geminiPayload: unknown
+): Promise<StreamAttemptResult> {
+  // Use SSE streaming endpoint (alt=sse) with streamGenerateContent for instant word-by-word response
   const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
     modelName
-  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  )}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 25000); // 25s timeout per request
+    const timeoutId = setTimeout(() => controller.abort(), 20000); // 20s initial connection timeout
 
     let res: Response;
     try {
@@ -39,6 +40,7 @@ async function callGeminiModel(
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          Accept: "text/event-stream",
         },
         body: JSON.stringify(geminiPayload),
         signal: controller.signal,
@@ -53,14 +55,14 @@ async function callGeminiModel(
         ok: false,
         status: 504,
         errorMessage: "Network timeout or connection error while contacting Gemini API.",
+        isRetryable: true,
       };
     } finally {
       clearTimeout(timeoutId);
     }
 
-    if (res.ok) {
-      const data = await res.json().catch(() => null);
-      return { ok: true, status: res.status, data };
+    if (res.ok && res.body) {
+      return { ok: true, status: res.status, response: res };
     }
 
     const errorText = await res.text().catch(() => "");
@@ -72,14 +74,14 @@ async function callGeminiModel(
       }
     } catch {}
 
-    const isHighDemand =
+    const isRetryable =
       res.status === 503 ||
+      res.status === 429 ||
       errMsg.toLowerCase().includes("high demand") ||
       errMsg.toLowerCase().includes("overloaded") ||
       errMsg.toLowerCase().includes("spikes in demand");
 
-    // Retry on 503 or temporary high demand spikes with exponential backoff
-    if (isHighDemand && attempt < MAX_RETRIES) {
+    if (isRetryable && attempt < MAX_RETRIES) {
       await sleep(INITIAL_BACKOFF_MS * Math.pow(2, attempt));
       continue;
     }
@@ -88,7 +90,7 @@ async function callGeminiModel(
       ok: false,
       status: res.status,
       errorMessage: errMsg,
-      isHighDemand,
+      isRetryable,
     };
   }
 
@@ -96,7 +98,7 @@ async function callGeminiModel(
     ok: false,
     status: 503,
     errorMessage: "Model temporarily unavailable due to high demand.",
-    isHighDemand: true,
+    isRetryable: true,
   };
 }
 
@@ -135,28 +137,20 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Limit message size to prevent abuse (max 4000 chars)
-    if (message.length > 4000) {
-      return NextResponse.json<ChatResponse>(
-        {
-          success: false,
-          error: "Message is too long. Please limit your input to 4,000 characters.",
-        },
-        { status: 400 }
-      );
-    }
+    // Limit user message size (max 3000 chars) for prompt efficiency
+    const trimmedMessage = message.trim().slice(0, 3000);
 
     // Prepare contents array for Gemini REST API
     const contents: Array<{ role: "user" | "model"; parts: [{ text: string }] }> = [];
 
-    // Include recent history (limit to last 16 turns to keep context optimal)
+    // Keep only the last 6 turns (3 exchanges) of history to minimize input token processing overhead
     if (Array.isArray(history)) {
-      const recentHistory = history.slice(-16);
+      const recentHistory = history.slice(-6);
       for (const item of recentHistory) {
         if (item.content && typeof item.content === "string") {
           contents.push({
             role: item.role === "assistant" ? "model" : "user",
-            parts: [{ text: item.content.slice(0, 3000) }],
+            parts: [{ text: item.content.slice(0, 1500) }],
           });
         }
       }
@@ -165,9 +159,10 @@ export async function POST(req: NextRequest) {
     // Add current user prompt
     contents.push({
       role: "user",
-      parts: [{ text: message.trim() }],
+      parts: [{ text: trimmedMessage }],
     });
 
+    // Optimized payload: 1024 maxOutputTokens is ideal for fast academic explanations and code snippets
     const geminiPayload = {
       system_instruction: {
         parts: [{ text: SYSTEM_INSTRUCTION }],
@@ -177,56 +172,92 @@ export async function POST(req: NextRequest) {
         temperature: 0.7,
         topK: 40,
         topP: 0.95,
-        maxOutputTokens: 2048,
+        maxOutputTokens: 1024,
       },
     };
 
-    // 1. Try primary model with up to 3 retries (exponential backoff on 503)
-    let callResult = await callGeminiModel(primaryModel, apiKey, geminiPayload);
+    // 1. Attempt streaming with primary model (gemini-3.8-flash)
+    let streamResult = await tryStreamGemini(primaryModel, apiKey, geminiPayload);
 
-    // 2. If primary model continues returning 503 / high demand, switch to fallback model
-    if (!callResult.ok && callResult.isHighDemand && primaryModel !== FALLBACK_MODEL) {
-      callResult = await callGeminiModel(FALLBACK_MODEL, apiKey, geminiPayload);
+    // 2. Fallback to gemini-3.5-flash-lite if primary is overloaded or returns 503/429
+    if (!streamResult.ok && streamResult.isRetryable && primaryModel !== FALLBACK_MODEL) {
+      streamResult = await tryStreamGemini(FALLBACK_MODEL, apiKey, geminiPayload);
     }
 
-    if (!callResult.ok) {
-      let finalErrorMessage = callResult.errorMessage || "An unexpected error occurred.";
+    if (!streamResult.ok || !streamResult.response?.body) {
+      let finalErrorMessage = streamResult.errorMessage || "An unexpected error occurred.";
 
-      if (callResult.isHighDemand) {
+      if (streamResult.isRetryable) {
         finalErrorMessage =
-          "The AI models are currently experiencing unusually high demand. We automatically retried your request, but the service is still busy. Please wait a moment and try asking again.";
-      } else if (callResult.status === 400 && finalErrorMessage.toLowerCase().includes("api_key")) {
+          "The AI models are currently experiencing high demand. Please wait a moment and try asking again.";
+      } else if (streamResult.status === 400 && finalErrorMessage.toLowerCase().includes("api_key")) {
         finalErrorMessage = "Invalid Gemini API key provided. Please verify your GEMINI_API_KEY.";
-      } else if (callResult.status === 429) {
+      } else if (streamResult.status === 429) {
         finalErrorMessage = "Gemini API rate limit reached. Please wait a moment before asking again.";
       }
 
       return NextResponse.json<ChatResponse>(
         { success: false, error: finalErrorMessage },
-        { status: callResult.status >= 400 && callResult.status < 600 ? callResult.status : 500 }
+        { status: streamResult.status >= 400 && streamResult.status < 600 ? streamResult.status : 500 }
       );
     }
 
-    const data = callResult.data;
-    const candidate = data?.candidates?.[0];
-    const text = candidate?.content?.parts?.[0]?.text;
+    // Transform Gemini's SSE stream into a clean raw text stream
+    const geminiBody = streamResult.response.body;
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
 
-    if (!text) {
-      const finishReason = candidate?.finishReason;
-      return NextResponse.json<ChatResponse>(
-        {
-          success: false,
-          error: finishReason
-            ? `Response was halted by Gemini (reason: ${finishReason}). Please rephrase your question.`
-            : "No response was generated. Please try again.",
-        },
-        { status: 500 }
-      );
-    }
+    let buffer = "";
 
-    return NextResponse.json<ChatResponse>({
-      success: true,
-      text,
+    const transformStream = new TransformStream({
+      transform(chunk, controller) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split("\n");
+        // Keep the last partial line in buffer
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith("data: ")) {
+            const dataStr = trimmed.slice(6).trim();
+            if (dataStr === "[DONE]") continue;
+
+            try {
+              const parsed = JSON.parse(dataStr);
+              const text = parsed?.candidates?.[0]?.content?.parts?.[0]?.text;
+              if (text) {
+                controller.enqueue(encoder.encode(text));
+              }
+            } catch {
+              // Ignore unparseable SSE line fragments
+            }
+          }
+        }
+      },
+      flush(controller) {
+        if (buffer.trim()) {
+          const trimmed = buffer.trim();
+          if (trimmed.startsWith("data: ")) {
+            try {
+              const parsed = JSON.parse(trimmed.slice(6).trim());
+              const text = parsed?.candidates?.[0]?.content?.parts?.[0]?.text;
+              if (text) {
+                controller.enqueue(encoder.encode(text));
+              }
+            } catch {}
+          }
+        }
+      },
+    });
+
+    const readable = geminiBody.pipeThrough(transformStream);
+
+    return new Response(readable, {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "X-Content-Type-Options": "nosniff",
+      },
     });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "An unexpected server error occurred.";
@@ -236,4 +267,3 @@ export async function POST(req: NextRequest) {
     );
   }
 }
-
