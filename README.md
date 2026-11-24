@@ -46,7 +46,7 @@ Edit `.env.local` and fill in your API key:
 
 ```
 GEMINI_API_KEY=your_actual_gemini_api_key_here
-GEMINI_MODEL=gemini-1.5-flash
+GEMINI_MODEL=gemini-2.5-flash
 ```
 
 ```bash
@@ -67,7 +67,7 @@ Open [http://localhost:3000](http://localhost:3000) in your browser.
    | Variable | Value |
    |---|---|
    | `GEMINI_API_KEY` | Your Gemini API key (required) |
-   | `GEMINI_MODEL` | `gemini-1.5-flash` (optional, this is the default) |
+   | `GEMINI_MODEL` | `gemini-2.5-flash` (optional, this is the default) |
 
 4. Click **Deploy**. Done!
 
@@ -102,7 +102,7 @@ ai-student-chatbot/
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `GEMINI_API_KEY` | ✅ Yes | — | Your Google Gemini API key |
-| `GEMINI_MODEL` | No | `gemini-1.5-flash` | Gemini model to use |
+| `GEMINI_MODEL` | No | `gemini-2.5-flash` | Gemini model to use |
 
 > ⚠️ **Never commit `.env.local` to Git.** It is already excluded by `.gitignore`.
 
@@ -128,3 +128,4 @@ ai-student-chatbot/
 ## 📄 License
 
 MIT License — feel free to use, modify, and share.
+
