@@ -1,4 +1,4 @@
-export const DEFAULT_MODEL = "gemini-2.5-flash";
+export const DEFAULT_MODEL = "gemini-3.8-flash";
 
 export const SYSTEM_INSTRUCTION = `You are the AI Student Assistant, an expert, patient, encouraging, and highly knowledgeable academic tutor.
 Your mission is to help college and university students master their subjects and excel in their studies.
