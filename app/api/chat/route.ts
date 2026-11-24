@@ -1,9 +1,104 @@
 import { NextRequest, NextResponse } from "next/server";
-import { DEFAULT_MODEL, SYSTEM_INSTRUCTION } from "@/lib/gemini";
+import { DEFAULT_MODEL, FALLBACK_MODEL, SYSTEM_INSTRUCTION } from "@/lib/gemini";
 import { ChatRequest, ChatResponse } from "@/types/chat";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+const MAX_RETRIES = 3;
+const INITIAL_BACKOFF_MS = 1000; // 1s, 2s, 4s exponential backoff
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+interface GeminiCallResult {
+  ok: boolean;
+  status: number;
+  data?: any;
+  errorMessage?: string;
+  isHighDemand?: boolean;
+}
+
+async function callGeminiModel(
+  modelName: string,
+  apiKey: string,
+  geminiPayload: any
+): Promise<GeminiCallResult> {
+  const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    modelName
+  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 25000); // 25s timeout per request
+
+    let res: Response;
+    try {
+      res = await fetch(apiUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(geminiPayload),
+        signal: controller.signal,
+      });
+    } catch (err: unknown) {
+      clearTimeout(timeoutId);
+      if (attempt < MAX_RETRIES) {
+        await sleep(INITIAL_BACKOFF_MS * Math.pow(2, attempt));
+        continue;
+      }
+      return {
+        ok: false,
+        status: 504,
+        errorMessage: "Network timeout or connection error while contacting Gemini API.",
+      };
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    if (res.ok) {
+      const data = await res.json().catch(() => null);
+      return { ok: true, status: res.status, data };
+    }
+
+    const errorText = await res.text().catch(() => "");
+    let errMsg = `Gemini API returned status ${res.status}.`;
+    try {
+      const errorJson = JSON.parse(errorText);
+      if (errorJson?.error?.message) {
+        errMsg = errorJson.error.message;
+      }
+    } catch {}
+
+    const isHighDemand =
+      res.status === 503 ||
+      errMsg.toLowerCase().includes("high demand") ||
+      errMsg.toLowerCase().includes("overloaded") ||
+      errMsg.toLowerCase().includes("spikes in demand");
+
+    // Retry on 503 or temporary high demand spikes with exponential backoff
+    if (isHighDemand && attempt < MAX_RETRIES) {
+      await sleep(INITIAL_BACKOFF_MS * Math.pow(2, attempt));
+      continue;
+    }
+
+    return {
+      ok: false,
+      status: res.status,
+      errorMessage: errMsg,
+      isHighDemand,
+    };
+  }
+
+  return {
+    ok: false,
+    status: 503,
+    errorMessage: "Model temporarily unavailable due to high demand.",
+    isHighDemand: true,
+  };
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -19,7 +114,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const model = process.env.GEMINI_MODEL?.trim() || DEFAULT_MODEL;
+    const primaryModel = process.env.GEMINI_MODEL?.trim() || DEFAULT_MODEL;
 
     let body: ChatRequest;
     try {
@@ -52,7 +147,6 @@ export async function POST(req: NextRequest) {
     }
 
     // Prepare contents array for Gemini REST API
-    // Format: contents: [{ role: 'user' | 'model', parts: [{ text }] }]
     const contents: Array<{ role: "user" | "model"; parts: [{ text: string }] }> = [];
 
     // Include recent history (limit to last 16 turns to keep context optimal)
@@ -74,10 +168,6 @@ export async function POST(req: NextRequest) {
       parts: [{ text: message.trim() }],
     });
 
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-      model
-    )}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
     const geminiPayload = {
       system_instruction: {
         parts: [{ text: SYSTEM_INSTRUCTION }],
@@ -91,64 +181,33 @@ export async function POST(req: NextRequest) {
       },
     };
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 35000); // 35s timeout
+    // 1. Try primary model with up to 3 retries (exponential backoff on 503)
+    let callResult = await callGeminiModel(primaryModel, apiKey, geminiPayload);
 
-    let res: Response;
-    try {
-      res = await fetch(apiUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(geminiPayload),
-        signal: controller.signal,
-      });
-    } catch (err: unknown) {
-      clearTimeout(timeoutId);
-      if (err instanceof Error && err.name === "AbortError") {
-        return NextResponse.json<ChatResponse>(
-          {
-            success: false,
-            error: "The request timed out while waiting for a response from Gemini. Please try again.",
-          },
-          { status: 504 }
-        );
-      }
-      return NextResponse.json<ChatResponse>(
-        {
-          success: false,
-          error: "Network error connecting to Gemini API. Please check your internet connection.",
-        },
-        { status: 502 }
-      );
-    } finally {
-      clearTimeout(timeoutId);
+    // 2. If primary model continues returning 503 / high demand, switch to fallback model
+    if (!callResult.ok && callResult.isHighDemand && primaryModel !== FALLBACK_MODEL) {
+      callResult = await callGeminiModel(FALLBACK_MODEL, apiKey, geminiPayload);
     }
 
-    if (!res.ok) {
-      const errorText = await res.text().catch(() => "");
-      let errorMessage = `Gemini API returned status ${res.status}.`;
-      try {
-        const errorJson = JSON.parse(errorText);
-        if (errorJson?.error?.message) {
-          errorMessage = errorJson.error.message;
-        }
-      } catch {}
+    if (!callResult.ok) {
+      let finalErrorMessage = callResult.errorMessage || "An unexpected error occurred.";
 
-      if (res.status === 400 && errorMessage.toLowerCase().includes("api_key")) {
-        errorMessage = "Invalid Gemini API key provided. Please verify your GEMINI_API_KEY.";
-      } else if (res.status === 429) {
-        errorMessage = "Gemini API rate limit reached. Please wait a moment before asking again.";
+      if (callResult.isHighDemand) {
+        finalErrorMessage =
+          "The AI models are currently experiencing unusually high demand. We automatically retried your request, but the service is still busy. Please wait a moment and try asking again.";
+      } else if (callResult.status === 400 && finalErrorMessage.toLowerCase().includes("api_key")) {
+        finalErrorMessage = "Invalid Gemini API key provided. Please verify your GEMINI_API_KEY.";
+      } else if (callResult.status === 429) {
+        finalErrorMessage = "Gemini API rate limit reached. Please wait a moment before asking again.";
       }
 
       return NextResponse.json<ChatResponse>(
-        { success: false, error: errorMessage },
-        { status: res.status >= 400 && res.status < 600 ? res.status : 500 }
+        { success: false, error: finalErrorMessage },
+        { status: callResult.status >= 400 && callResult.status < 600 ? callResult.status : 500 }
       );
     }
 
-    const data = await res.json();
+    const data = callResult.data;
     const candidate = data?.candidates?.[0];
     const text = candidate?.content?.parts?.[0]?.text;
 
